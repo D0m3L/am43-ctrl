@@ -1,3 +1,125 @@
+# Fork — modified am43-ctrl v1.1
+
+## My setup
+
+This fork is used in production on a **Raspberry Pi 4** (64-bit OS, `aarch64`) with **two AM43 blind motors** controlled over MQTT and HTTP:
+
+| Label | MAC | Role |
+|-------|-----|------|
+| **lewa** | `02:73:f4:0a:2a:a1` (`0273f40a2aa1`) | Left blind |
+| **prawa** | `02:51:eb:6e:37:ca` (`0251eb6e37ca`) | Right blind |
+
+Both motors are about **10–15 meters (and two walls in betwenn)** from the Pi’s Bluetooth adapter. The controller runs in Docker on the Pi (see below) or natively; MQTT publishes to Home Assistant, HTTP API on port 5001.
+
+### Why this fork exists (problem in upstream code)
+
+With two devices sharing one BLE adapter, upstream [binsentsu/am43-ctrl](https://github.com/binsentsu/am43-ctrl) uses a static `busyDevice` lock so only one motor connects at a time. That works until **noble drops the link without firing a `disconnect` event** — which happened regularly here, especially on the weaker motor.
+
+Symptoms with the original driver:
+
+- One motor finished `Reading data completed` but never logged `disconnected for data reading` / `Reading data was successful`
+- `busyDevice` stayed set on the stalled device
+- The other motor logged `Connection busy for other device …, delaying data read…` indefinitely — the app looked **hung**
+- Interval polls failed while startup reads sometimes still worked
+
+**v1.1** adds `tryClearStaleBusy`, unified session teardown (`finishReadSession`), and a 3 s missing-disconnect fallback so the lock is cleared and both blinds recover.
+
+### RF environment (RSSI)
+
+At 10–15 meters (and two walls in betwenn), devices with the **factory BLE antenna inside the motor housing**, RSSI was around **~ -81 dBm to -85 dBm** — very weak and unstable. Connects often dropped within ~30 ms before GATT discovery; interval polls failed reliably.
+
+**Hardware fix:** routing the BLE antenna **outside** the motor housing improved signal to **~ -77 dBm** in btmon (`LE Advertising Report`). That is still on the edge for BLE, but with **v1.1** both motors poll reliably (startup + 10–20 min intervals).
+
+---
+
+This repository is a fork of [binsentsu/am43-ctrl](https://github.com/binsentsu/am43-ctrl). **All original credit goes to [binsentsu](https://github.com/binsentsu) and the upstream project.** This fork keeps the same purpose: controlling AM43 blind motors over MQTT and/or HTTP.
+
+**Notice:** Parts of this fork were modified with assistance from AI. Review the changes before production use.
+
+## What changed in v1.1 (vs upstream)
+
+Changes are documented in the file headers of `index.js` and `src/am43.js`. Summary:
+
+**`src/am43.js` (BLE driver)**
+- Multi-device stability when noble drops a link without firing `disconnect` (`tryClearStaleBusy`, `finishReadSession`, 3s missing-disconnect fallback)
+- Unique poll interval per device (random 10–20 min, or `--interval` with 60s stagger); no shared timer collision
+- Position remap 99→100 and 1→0 for Home Assistant alignment
+- Shorter post-command read timing (`fullMovingTime` 15s vs upstream 137s)
+- Driver version and friendly device tags in logs
+
+**`index.js` (entrypoint)**
+- Version logging at startup; noble warnings on both debug channels
+- Heartbeat shows device tag for last successful device
+- Less log noise during scan; duplicate discover events ignored
+
+Upstream usage, MQTT topics, and HTTP API behaviour are unchanged — see the original README below.
+
+---
+
+## Docker on Raspberry Pi 4
+
+This fork includes a Docker setup tested on **Raspberry Pi 4** with a 64-bit OS (`Linux pi4 6.1.21-v8+ … aarch64`). The image is built for **`linux/arm/v7`** (32-bit ARM). On Pi 4, Docker runs it via the `--platform linux/arm/v7` flag (see `create-docker-container.sh`).
+
+### `Dockerfile` overview
+
+| Item | Detail |
+|------|--------|
+| Base image | `node:14.15.1-alpine` (`linux/arm/v7`) |
+| BLE stack | `@abandonware/noble@1.9.2-14`, `@abandonware/bluetooth-hci-socket@0.5.3-7` (pinned) |
+| Build deps | `eudev-dev`, `libusb-dev`, `python3`, `make`, `g++` (native module compile) |
+| Runtime | `am43ctrl` with MQTT (`--url`), HTTP API (`-l`), debug (`-d`), fail timeout (`-f`) |
+
+**Environment variables** (defaults in `Dockerfile`, override at `docker run`):
+
+| Variable | Purpose |
+|----------|---------|
+| `MAC1`, `MAC2` | BLE MAC addresses of blinds |
+| `URL` | MQTT broker URL (`mqtt://…`) |
+| `PORT` | HTTP API port (`-l`) |
+| `TIMEO` | `-f` fail timeout (seconds since last successful read before exit) |
+| `MQTTUSER`, `MQTTPWD` | MQTT credentials (defined in Dockerfile; add `-u`/`-p` to ENTRYPOINT if needed) |
+
+**Important:** The current `Dockerfile` runs `npm install https://github.com/binsentsu/am43-ctrl`, which installs **upstream** code. To run **this fork (v1.1)**, build from a Dockerfile that copies this repository into the image (e.g. `COPY . /app/rolety/` and `npm install --legacy-peer-deps`) instead of installing from GitHub.
+
+BLE inside Docker requires host networking and elevated privileges — the container must see the Pi’s Bluetooth adapter.
+
+### Build and run
+
+From this repository root:
+
+```bash
+# 1. Build the image (adjust Dockerfile first if you want v1.1 local code, not upstream npm)
+docker build --platform linux/arm/v7 -t rolety:latest .
+
+# 2. Create/start the container (edit MACs, broker URL, ports in the script first)
+chmod +x create-docker-container.sh
+./create-docker-container.sh
+```
+
+### `create-docker-container.sh`
+
+Helper script that runs the container with settings suited to Pi BLE + MQTT:
+
+- `--net=host` — host network (MQTT and BLE HCI)
+- `--privileged`, `--cap-add NET_ADMIN`, `--cap-add NET_RAW` — Bluetooth access
+- `-v /var/run/dbus:/var/run/dbus` — D-Bus for BlueZ
+- `--restart=unless-stopped` — auto-restart on reboot
+- `-e DEBUG="am43:*"` — verbose driver logging
+- `-e MAC1`, `MAC2`, `URL`, `PORT`, `TIMEO` — override Dockerfile defaults
+
+Edit the script before running (MAC addresses, MQTT broker IP, `TIMEO`, etc.). To recreate after changes:
+
+```bash
+docker stop rolety && docker rm rolety
+./create-docker-container.sh
+```
+
+Logs: `docker logs -f rolety`
+
+---
+
+# Original README (upstream — unchanged)
+
 # AM43 Blinds Drive Controller Util
 Util for controlling a am43 Cover, either over MQTT or via a HTTP API. When used over MQTT it works together with home-assistant and performs auto disovery configuration of the cover component.
 (Eg. https://nl.aliexpress.com/item/4000106179323.html)
