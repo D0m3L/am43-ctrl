@@ -1,3 +1,19 @@
+/*
+ * am43 BLE driver — version 1.1 (2026-06-12 12:30 CEST)
+ *
+ * v1.1 vs upstream binsentsu/am43-ctrl (https://github.com/binsentsu/am43-ctrl/tree/master/src):
+ * - Multi-device stability: tryClearStaleBusy clears busyDevice when noble drops link without
+ *   a disconnect event; calls peripheral.disconnect() and logs stale-session teardown
+ * - Read session: finishReadSession unifies disconnect handling; 3s fallback if disconnect()
+ *   is called but no disconnect event arrives (sessionEnded / disconnectHandled guards)
+ * - Per-device poll intervals: unique random 10–20 min (or --interval + 60s stagger per slot);
+ *   collision detection via assignedIntervals; logs interval ms/min and peer intervals
+ * - Position remap 99→100 and 1→0 with org/modified log line (upstream logs raw position only)
+ * - fullMovingTime 15s (upstream 137s); scheduleForcedDataRead at 5s and fullMovingTime+10s
+ * - DRIVER_VERSION, deviceTag() export, friendly device labels in heartbeat logs
+ * - Driver version logged at am43Init startup
+ */
+
 const EventEmitter = require('events');
 
 const serviceUUID = '0000fe5000001000800000805f9b34fb';
@@ -23,11 +39,45 @@ const batteryNotificationIdentifier = "a2";
 const positionNotificationIdentifier = "a7";
 const lightNotificationIdentifier = "aa";
 
-const fullMovingTime = 137000;
+//const fullMovingTime = 137000;
+const fullMovingTime = 15000;
 
+const DRIVER_VERSION = '1.1';
+const INIT_STAGGER_MS = 60000;
+const MISSING_DISCONNECT_CHECK_MS = 3000;
+
+/** Friendly names for known device MACs (used in heartbeat logs). */
+const deviceLabels = {
+    '0273f40a2aa1': 'lewa',
+    '0251eb6e37ca': 'prawa',
+};
+
+/**
+ * Returns a short log tag for a device id ([lewa], [prawa], or [mac]).
+ * @param {string} id - Normalized MAC address without colons
+ */
+function deviceTag(id) {
+    return deviceLabels[id] ? `[${deviceLabels[id]}]` : `[${id}]`;
+}
+
+/**
+ * BLE driver for AM43 blind motors. One instance per peripheral; serializes BLE access
+ * across devices via static busyDevice. Emits stateChanged after successful reads/writes.
+ */
 class am43 extends EventEmitter {
+    static VERSION = DRIVER_VERSION;
+    /** Device currently holding the shared BLE connection, or null. */
     static busyDevice = null;
+    /** Poll intervals already assigned so two devices never share the same timer. */
+    static assignedIntervals = new Set();
+    /** Increments per device at init to stagger fixed --interval polls. */
+    static initSlot = 0;
 
+    /**
+     * @param {string} id - Normalized MAC address
+     * @param {object} peripheral - noble Peripheral
+     * @param {object} noble - noble module instance
+     */
     constructor(id, peripheral, noble) {
         super();
         this.log = require('debug')(`am43:${id}`);
@@ -35,6 +85,7 @@ class am43 extends EventEmitter {
         this.peripheral = peripheral;
         this.noble = noble;
         this.connecttime = null;
+        this.successtime = null;
         this.lastaction = null;
         this.state = null;
         this.currentRetry = 0;
@@ -48,15 +99,50 @@ class am43 extends EventEmitter {
         this.positionpercentage = null;
     }
 
+    /** Writes a debug line prefixed with am43:{id}. */
     writeLog(pLogLine) {
         this.log(pLogLine);
     }
 
+    /**
+     * Clears busyDevice when the busy peripheral is already disconnected but noble
+     * never fired disconnect (stalled session). Calls disconnect() for GATT cleanup.
+     */
+    static tryClearStaleBusy() {
+        const busy = am43.busyDevice;
+        if (busy == null) {
+            return;
+        }
+        try {
+            if (busy.peripheral.state === 'disconnected') {
+                busy.writeLog(
+                    'clearing stale busyDevice' +
+                    ' (peripheral disconnected, no disconnect event)'
+                );
+                try {
+                    busy.peripheral.disconnect();
+                } catch (e) {
+                    busy.writeLog('disconnect() on stale session failed: ' + e.message);
+                }
+                busy.writeLog('disconnected for data reading (stale busy cleared)');
+                am43.busyDevice = null;
+            }
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    /**
+     * Entry point for periodic/status reads. Waits if another device holds busyDevice,
+     * then delegates to performReadData.
+     */
     readData() {
+        am43.tryClearStaleBusy();
+
         if (am43.busyDevice != null) {
-            this.writeLog('Connection busy for other device, delaying data read...');
+            this.writeLog('Connection busy for other device ' + am43.busyDevice.id + ', delaying data read...');
             setTimeout(() => {
-                this.readData()
+                this.readData();
             }, 1000);
             return;
         }
@@ -64,6 +150,10 @@ class am43 extends EventEmitter {
         this.performReadData();
     }
 
+    /**
+     * Connects, discovers the data characteristic, reads battery/light/position via
+     * notifications, unsubscribes, disconnects. Retries on incomplete data.
+     */
     performReadData() {
         this.batterysuccess = false;
         this.positionsuccess = false;
@@ -74,7 +164,80 @@ class am43 extends EventEmitter {
         this.peripheral.once('connect', handleDeviceConnected);
         this.peripheral.once('disconnect', disconnectMe);
         const self = this;
+        let sessionEnded = false;
+        let disconnectHandled = false;
+        let missingDisconnectTimeout = null;
 
+        /** Cancels the 3s missing-disconnect watchdog. */
+        function clearMissingDisconnectCheck() {
+            if (missingDisconnectTimeout) {
+                clearTimeout(missingDisconnectTimeout);
+                missingDisconnectTimeout = null;
+            }
+        }
+
+        /** Starts watchdog: finish session if disconnect event never arrives after disconnect(). */
+        function scheduleMissingDisconnectCheck() {
+            clearMissingDisconnectCheck();
+            missingDisconnectTimeout = setTimeout(() => {
+                missingDisconnectTimeout = null;
+                if (sessionEnded) {
+                    return;
+                }
+                let state = 'unknown';
+                try {
+                    state = self.peripheral.state;
+                } catch (e) {
+                    // ignore
+                }
+                finishReadSession(' (no disconnect event, peripheral state: ' + state + ')');
+            }, MISSING_DISCONNECT_CHECK_MS);
+        }
+
+        /** Requests BLE disconnect and arms the missing-disconnect fallback. */
+        function requestDisconnect() {
+            scheduleMissingDisconnectCheck();
+            try {
+                self.peripheral.disconnect();
+            } catch (e) {
+                self.writeLog('disconnect() failed: ' + e.message);
+            }
+        }
+
+        /**
+         * Ends the read session once: logs disconnect, retries or marks success,
+         * clears busyDevice, emits stateChanged on full success.
+         */
+        function finishReadSession(logSuffix) {
+            if (sessionEnded) {
+                return;
+            }
+            sessionEnded = true;
+            clearMissingDisconnectCheck();
+            self.writeLog('disconnected for data reading' + logSuffix);
+
+            if (self.batterysuccess === false || self.positionsuccess === false || self.lightsuccess === false) {
+                if (self.currentRetry < self.maxRetries) {
+                    self.writeLog("Reading data unsuccessful, retrying in 1 second...");
+                    self.currentRetry = self.currentRetry + 1;
+                    setTimeout(() => {
+                        self.performReadData();
+                    }, 1000);
+                } else {
+                    self.writeLog("Reading data unsuccessful, giving up...");
+                    am43.busyDevice = null;
+                    self.currentRetry = 0;
+                }
+            } else {
+                self.writeLog("Reading data was successful");
+                self.successtime = new Date();
+                am43.busyDevice = null;
+                self.currentRetry = 0;
+                self.emit('stateChanged', self.getState());
+            }
+        }
+
+        /** On connect: discover fe50/fe51 and start notification-driven read chain. */
         function handleDeviceConnected() {
             self.connecttime = new Date();
             self.writeLog('AM43 connected for data reading');
@@ -84,73 +247,56 @@ class am43 extends EventEmitter {
             self.peripheral.discoverSomeServicesAndCharacteristics(serviceUID, characteristicUUIDs, discoveryResult);
         }
 
+        /** noble disconnect handler; delegates to finishReadSession. */
         function disconnectMe() {
-            self.writeLog('disconnected for data reading');
-
-            if (self.batterysuccess === false || self.positionsuccess === false || self.lightsuccess === false) {
-                if (self.currentRetry < self.maxRetries) {
-                    self.writeLog("Reading data unsuccessful, retrying in 1 second...");
-                    self.currentRetry = self.currentRetry + 1;
-                    setTimeout(() => {
-                        self.performReadData()
-                    }, 1000);
-                } else {
-                    self.writeLog("Reading data unsuccessful, giving up...");
-                    am43.busyDevice = null;
-                    self.currentRetry = 0;
-                }
-            } else {
-                self.writeLog("Reading data was successful");
-                am43.busyDevice = null;
-                self.currentRetry = 0;
-                self.emit('stateChanged', self.getState());
+            if (disconnectHandled) {
+                return;
             }
+            disconnectHandled = true;
+            finishReadSession('');
         }
 
+        /** Parses notification payloads (battery → light → position) and triggers disconnect when done. */
         function discoveryResult(error, services, characteristics) {
             if (error) {
                 self.writeLog("ERROR retrieving characteristic");
-                self.peripheral.disconnect();
+                requestDisconnect();
             } else {
                 self.writeLog('discovered data char');
                 let characteristic = characteristics[0];
                 characteristic.on('data', function (data, isNotification) {
                     self.writeLog('received characteristic update');
-                    //read data to buffer
                     let bfr = Buffer.from(data, "hex");
-                    //convert to hex string
                     let strBfr = bfr.toString("hex", 0, bfr.length);
                     self.writeLog('Notification data: ' + strBfr);
                     let notificationIdentifier = strBfr.substr(2, 2);
                     self.writeLog('Notification identifier: ' + notificationIdentifier);
                     if (batteryNotificationIdentifier === notificationIdentifier) {
-                        //battery is hexadecimal on position 14, 2 bytes
                         let batteryHex = strBfr.substr(14, 2);
-                        //convert hex number to integer
                         let batteryPercentage = parseInt(batteryHex, 16);
                         self.writeLog('Bat %: ' + batteryPercentage);
                         self.batterypercentage = batteryPercentage;
                         self.batterysuccess = true;
 
-                        //write cmd to enable light notification
                         characteristic.write(Buffer.from(HEY_KEY_LIGHT_REQUEST, "hex"), true);
                     } else if (lightNotificationIdentifier === notificationIdentifier) {
-                        //light is byte 4 (ex. 9a aa 02 00 00 32)
                         let lightHex = strBfr.substr(8, 2);
-                        //convert to integer
                         let lightPercentage = parseInt(lightHex, 16);
                         self.writeLog('Light %: ' + lightPercentage);
                         self.lightpercentage = lightPercentage;
                         self.lightsuccess = true;
 
-                        //write cmd to get position
                         characteristic.write(Buffer.from(HEY_KEY_POSITION_REQUEST, "hex"), true);
                     } else if (positionNotificationIdentifier === notificationIdentifier) {
-                        //position is byte 6: 9a a7 07 0f 32 4e 00 00 00 30 79
                         let positionHex = strBfr.substr(10, 2);
-                        //convert to integer
                         let positionPercentage = parseInt(positionHex, 16);
-                        self.writeLog('Position %: ' + positionPercentage);
+                        let positionPercentageOrg = positionPercentage;
+                        if (positionPercentage == 99) {
+                            positionPercentage = 100;
+                        } else if (positionPercentage == 1) {
+                            positionPercentage = 0;
+                        }
+                        self.writeLog('Position org %: ' + positionPercentageOrg + '. Position modified %: ' + positionPercentage);
                         self.positionpercentage = positionPercentage;
                         self.positionsuccess = true;
                         self.reevaluateState();
@@ -160,23 +306,26 @@ class am43 extends EventEmitter {
                         self.writeLog("Reading data completed");
                         characteristic.unsubscribe();
                         setTimeout(() => {
-                            self.peripheral.disconnect();
+                            requestDisconnect();
                         }, 1000);
                     }
                 });
-                //subscribe to notifications on the char
                 characteristic.subscribe();
-                //write cmd to enable battery notification
                 characteristic.write(Buffer.from(HEX_KEY_BATTERY_REQUEST, "hex"), true);
             }
         }
     }
 
+    /**
+     * Entry point for command writes (open/close/stop/position). Waits if BLE is busy.
+     */
     writeKey(handle, key) {
+        am43.tryClearStaleBusy();
+
         if (am43.busyDevice != null) {
             this.writeLog('Connection busy for other device, waiting...');
             setTimeout(() => {
-                this.writeKey(handle, key)
+                this.writeKey(handle, key);
             }, 1000);
             return;
         }
@@ -184,6 +333,7 @@ class am43 extends EventEmitter {
         this.performWriteKey(handle, key);
     }
 
+    /** Connects, writes a hex key to the given GATT handle, disconnects, retries on failure. */
     performWriteKey(handle, key) {
         this.success = false;
         am43.busyDevice = this;
@@ -205,7 +355,7 @@ class am43 extends EventEmitter {
                     self.writeLog("Writing unsuccessful, retrying in 1 second...");
                     self.currentRetry = self.currentRetry + 1;
                     setTimeout(() => {
-                        self.performWriteKey(handle, key)
+                        self.performWriteKey(handle, key);
                     }, 1000);
                 } else {
                     self.writeLog("Writing unsuccessful, giving up...");
@@ -235,39 +385,65 @@ class am43 extends EventEmitter {
         }
     }
 
-    am43Init() {
+    /**
+     * Starts this device: initial read after 5s, then periodic readData on a unique interval.
+     * @param {number} poll - Minutes from CLI --interval; 0 = random 10–20 min per device
+     */
+    am43Init(poll = 0) {
         const self = this;
+        const slot = am43.initSlot++;
+
+        this.writeLog('driver v' + DRIVER_VERSION);
 
         setTimeout(() => {
-            self.readData()
+            self.readData();
         }, 5000);
 
-        const interval = this.randomIntMinutes(10, 20);
-        this.writeLog("interval: " + interval);
+        let intervalMS;
+        if (poll > 0) {
+            intervalMS = poll * 60 * 1000 + slot * INIT_STAGGER_MS;
+        } else {
+            let attempts = 0;
+            do {
+                intervalMS = this.randomIntMinutes(10, 20);
+                attempts++;
+            } while (am43.assignedIntervals.has(intervalMS) && attempts < 50);
+        }
+
+        while (am43.assignedIntervals.has(intervalMS)) {
+            this.writeLog('interval collision with other device, adding ' + INIT_STAGGER_MS + 'ms stagger');
+            intervalMS += INIT_STAGGER_MS;
+        }
+        am43.assignedIntervals.add(intervalMS);
+
+        const otherIntervals = [...am43.assignedIntervals].filter((v) => v !== intervalMS);
+        this.writeLog(
+            'interval: ' + intervalMS + 'ms (' + Math.round(intervalMS / 60000) + 'min)' +
+            ', other device intervals: ' + (otherIntervals.length ? otherIntervals.join(',') : 'none')
+        );
         setInterval(() => {
             self.readData();
-        }, interval);
+        }, intervalMS);
     }
 
+    /** Schedules extra reads after a motor command (early + after movement time). */
     scheduleForcedDataRead() {
         const self = this;
-        //we read data after 15 seconds (eg. to capture pretty fast the open state)
         setTimeout(() => {
-            self.readData()
-        }, 15000);
+            self.readData();
+        }, 5000);
 
-        //we read data after fullMovingTime + 5 seconds buffer (eg. to capture the closed state/end position when movement is complete)
         setTimeout(() => {
-            self.readData()
-        }, fullMovingTime + 5000);
-
-        //else we still have our 'slower' backup task which will provide updated data at later time
+            self.readData();
+        }, fullMovingTime + 10000);
     }
 
+    /** Random poll interval in milliseconds between min and max minutes (inclusive). */
     randomIntMinutes(min, max) {
         return 1000 * 60 * (Math.floor(Math.random() * (max - min + 1) + min));
     }
 
+    /** Sets OPEN/CLOSED state from positionpercentage (100 = closed). */
     reevaluateState() {
         if (this.positionpercentage === 100) {
             this.state = 'CLOSED';
@@ -276,53 +452,54 @@ class am43 extends EventEmitter {
         }
     }
 
+    /** Sends open command and updates local state. */
     am43Open() {
         this.writeKey(AM43HANDLE, HEX_KEY_OPEN_BLINDS);
         this.lastaction = 'OPEN';
         this.state = 'OPEN';
     }
 
+    /** Sends close command and updates local state. */
     am43Close() {
         this.writeKey(AM43HANDLE, HEX_KEY_CLOSE_BLINDS);
         this.lastaction = 'CLOSE';
         this.state = 'CLOSED';
     }
 
+    /** Sends stop command and updates local state. */
     am43Stop() {
         this.writeKey(AM43HANDLE, HEX_KEY_STOP_BLINDS);
         this.lastaction = 'STOP';
         this.state = 'OPEN';
     }
 
-    am43GotoPosition(position)
-    {
+    /** Sends goto-position command with XOR CRC; updates local state. */
+    am43GotoPosition(position) {
         var positionHex = position.toString(16);
-        if(positionHex.length === 1)
-        {
+        if (positionHex.length === 1) {
             positionHex = "0" + positionHex;
         }
         var buffer = Buffer.from(HEY_KEY_POSITION_BLIND_FIXED_CRC_CONTENT + positionHex, "hex");
         var crc = buffer[0];
-        for (var i=1; i<buffer.length; i++) {
+        for (var i = 1; i < buffer.length; i++) {
             crc = crc ^ buffer[i];
         }
 
         this.writeKey(AM43HANDLE, HEX_KEY_POSITION_BLINDS_PREFIX + HEY_KEY_POSITION_BLIND_FIXED_CRC_CONTENT + positionHex + crc.toString(16));
         this.lastaction = 'SET_POSITION';
-        if(position === 100)
-        {
+        if (position === 100) {
             this.state = 'CLOSED';
-        }
-        else
-        {
-            this.STATE = 'OPEN';
+        } else {
+            this.state = 'OPEN';
         }
     }
 
+    /** Snapshot of device id, timestamps, state, battery, light, and position for MQTT/UI. */
     getState() {
         return {
             id: this.id,
             lastconnect: this.connecttime,
+            lastsuccess: this.successtime,
             lastaction: this.lastaction,
             state: this.state,
             battery: this.batterypercentage,
@@ -333,3 +510,5 @@ class am43 extends EventEmitter {
 }
 
 module.exports = am43;
+module.exports.deviceTag = deviceTag;
+
