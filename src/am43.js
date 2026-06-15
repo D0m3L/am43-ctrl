@@ -1,17 +1,14 @@
 /*
- * am43 BLE driver — version 1.1 (2026-06-12 12:30 CEST)
+ * am43 BLE driver — version 1.2 (2026-06-16 10:18 CEST)
  *
- * v1.1 vs upstream binsentsu/am43-ctrl (https://github.com/binsentsu/am43-ctrl/tree/master/src):
- * - Multi-device stability: tryClearStaleBusy clears busyDevice when noble drops link without
- *   a disconnect event; calls peripheral.disconnect() and logs stale-session teardown
- * - Read session: finishReadSession unifies disconnect handling; 3s fallback if disconnect()
- *   is called but no disconnect event arrives (sessionEnded / disconnectHandled guards)
- * - Per-device poll intervals: unique random 10–20 min (or --interval + 60s stagger per slot);
- *   collision detection via assignedIntervals; logs interval ms/min and peer intervals
- * - Position remap 99→100 and 1→0 with org/modified log line (upstream logs raw position only)
- * - fullMovingTime 15s (upstream 137s); scheduleForcedDataRead at 5s and fullMovingTime+10s
- * - DRIVER_VERSION, deviceTag() export, friendly device labels in heartbeat logs
- * - Driver version logged at am43Init startup
+ * v1.2 (2026-06-16 10:18 CEST):
+ * - Disconnect fallback B+C (default): poll until peripheral.state is disconnected;
+ *   at 3s nudge disconnect() if still pending; at 5s force finish if no noble event
+ * - Set DISCONNECT_FALLBACK_MODE = 'v1.1' to restore 2026-06-12 behaviour (or use src/am43.v1.1.js)
+ *
+ * v1.1 (2026-06-12 12:30 CEST):
+ * - Multi-device stability: tryClearStaleBusy, finishReadSession, single 3s fallback
+ * - Per-device poll intervals, position remap, fullMovingTime 15s, deviceTag
  */
 
 const EventEmitter = require('events');
@@ -42,9 +39,20 @@ const lightNotificationIdentifier = "aa";
 //const fullMovingTime = 137000;
 const fullMovingTime = 15000;
 
-const DRIVER_VERSION = '1.1';
+const DRIVER_VERSION = '1.2';
 const INIT_STAGGER_MS = 60000;
+
+/**
+ * Missing-disconnect fallback after peripheral.disconnect():
+ * - 'v1.2' (default): poll every 500ms for disconnected; 3s nudge disconnect(); 5s force finish
+ * - 'v1.1': single 3s finish (2026-06-12 12:30 CEST); full file backup: src/am43.v1.1.js
+ */
+const DISCONNECT_FALLBACK_MODE = 'v1.2';
+
 const MISSING_DISCONNECT_CHECK_MS = 3000;
+const MISSING_DISCONNECT_PHASE1_MS = 3000;
+const MISSING_DISCONNECT_PHASE2_DELAY_MS = 2000;
+const DISCONNECT_STATE_POLL_MS = 500;
 
 /** Friendly names for known device MACs (used in heartbeat logs). */
 const deviceLabels = {
@@ -167,31 +175,106 @@ class am43 extends EventEmitter {
         let sessionEnded = false;
         let disconnectHandled = false;
         let missingDisconnectTimeout = null;
+        let missingDisconnectPhase1Timeout = null;
+        let missingDisconnectPhase2Timeout = null;
+        let disconnectStatePollInterval = null;
 
-        /** Cancels the 3s missing-disconnect watchdog. */
+        function getPeripheralState() {
+            try {
+                return self.peripheral.state;
+            } catch (e) {
+                return 'unknown';
+            }
+        }
+
+        /** Cancels all missing-disconnect timers and state poll. */
         function clearMissingDisconnectCheck() {
             if (missingDisconnectTimeout) {
                 clearTimeout(missingDisconnectTimeout);
                 missingDisconnectTimeout = null;
             }
+            if (missingDisconnectPhase1Timeout) {
+                clearTimeout(missingDisconnectPhase1Timeout);
+                missingDisconnectPhase1Timeout = null;
+            }
+            if (missingDisconnectPhase2Timeout) {
+                clearTimeout(missingDisconnectPhase2Timeout);
+                missingDisconnectPhase2Timeout = null;
+            }
+            if (disconnectStatePollInterval) {
+                clearInterval(disconnectStatePollInterval);
+                disconnectStatePollInterval = null;
+            }
         }
 
-        /** Starts watchdog: finish session if disconnect event never arrives after disconnect(). */
+        /** v1.2: finish when noble never fired disconnect but peripheral is disconnected. */
+        function tryFinishWhenDisconnected() {
+            if (sessionEnded) {
+                return;
+            }
+            if (getPeripheralState() === 'disconnected') {
+                finishReadSession(' (peripheral disconnected, no disconnect event)');
+            }
+        }
+
+        /**
+         * Arms missing-disconnect handling after disconnect().
+         * v1.1: single 3s finish. v1.2: poll + 3s nudge + 5s force finish.
+         */
         function scheduleMissingDisconnectCheck() {
             clearMissingDisconnectCheck();
-            missingDisconnectTimeout = setTimeout(() => {
-                missingDisconnectTimeout = null;
+
+            if (DISCONNECT_FALLBACK_MODE === 'v1.1') {
+                missingDisconnectTimeout = setTimeout(() => {
+                    missingDisconnectTimeout = null;
+                    if (sessionEnded) {
+                        return;
+                    }
+                    finishReadSession(' (no disconnect event, peripheral state: ' + getPeripheralState() + ')');
+                }, MISSING_DISCONNECT_CHECK_MS);
+                return;
+            }
+
+            disconnectStatePollInterval = setInterval(() => {
+                tryFinishWhenDisconnected();
+            }, DISCONNECT_STATE_POLL_MS);
+
+            missingDisconnectPhase1Timeout = setTimeout(() => {
+                missingDisconnectPhase1Timeout = null;
                 if (sessionEnded) {
                     return;
                 }
-                let state = 'unknown';
-                try {
-                    state = self.peripheral.state;
-                } catch (e) {
-                    // ignore
+                const state = getPeripheralState();
+                if (state === 'disconnected') {
+                    tryFinishWhenDisconnected();
+                    return;
                 }
-                finishReadSession(' (no disconnect event, peripheral state: ' + state + ')');
-            }, MISSING_DISCONNECT_CHECK_MS);
+                self.writeLog(
+                    'disconnect still pending after ' + (MISSING_DISCONNECT_PHASE1_MS / 1000) +
+                    's (state: ' + state + '), nudging disconnect()'
+                );
+                try {
+                    self.peripheral.disconnect();
+                } catch (e) {
+                    self.writeLog('disconnect() nudge failed: ' + e.message);
+                }
+                missingDisconnectPhase2Timeout = setTimeout(() => {
+                    missingDisconnectPhase2Timeout = null;
+                    if (sessionEnded) {
+                        return;
+                    }
+                    const state2 = getPeripheralState();
+                    if (state2 === 'disconnected') {
+                        tryFinishWhenDisconnected();
+                        return;
+                    }
+                    finishReadSession(
+                        ' (no disconnect event after ' +
+                        ((MISSING_DISCONNECT_PHASE1_MS + MISSING_DISCONNECT_PHASE2_DELAY_MS) / 1000) +
+                        's, peripheral state: ' + state2 + ')'
+                    );
+                }, MISSING_DISCONNECT_PHASE2_DELAY_MS);
+            }, MISSING_DISCONNECT_PHASE1_MS);
         }
 
         /** Requests BLE disconnect and arms the missing-disconnect fallback. */
@@ -393,7 +476,7 @@ class am43 extends EventEmitter {
         const self = this;
         const slot = am43.initSlot++;
 
-        this.writeLog('driver v' + DRIVER_VERSION);
+        this.writeLog('driver v' + DRIVER_VERSION + ', disconnect fallback ' + DISCONNECT_FALLBACK_MODE);
 
         setTimeout(() => {
             self.readData();
@@ -511,4 +594,5 @@ class am43 extends EventEmitter {
 
 module.exports = am43;
 module.exports.deviceTag = deviceTag;
+module.exports.DISCONNECT_FALLBACK_MODE = DISCONNECT_FALLBACK_MODE;
 

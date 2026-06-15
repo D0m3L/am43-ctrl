@@ -1,18 +1,16 @@
 #!/usr/bin/env node
 
 /*
- * am43 entrypoint — version 1.1 (2026-06-12 12:30 CEST)
+ * am43 entrypoint — version 1.2 (2026-06-16 10:18 CEST)
  *
- * v1.1 vs upstream binsentsu/am43-ctrl (https://github.com/binsentsu/am43-ctrl):
- * - Logs entrypoint and driver version at startup
- * - noble warning to both am43* and am43 debug channels (upstream: am43 only)
- * - Heartbeat shows deviceTag ([lewa]/[prawa]) for last successful device
- * - Ignored BLE devices logged once per id until initial scan completes (less noise)
- * - Skips duplicate discover events for the same MAC (upstream overwrites instance)
- * - Pairs with src/am43.js v1.1 (multi-device BLE stability and poll scheduling)
+ * v1.2 (2026-06-16 10:18 CEST):
+ * - Pairs with src/am43.js v1.2 (disconnect fallback B+C; see DISCONNECT_FALLBACK_MODE)
+ *
+ * v1.1 (2026-06-12 12:30 CEST):
+ * - Stop scan after discovery; version log, deviceTag heartbeat, noble warnings
  */
 
-const ENTRYPOINT_VERSION = '1.1';
+const ENTRYPOINT_VERSION = '1.2';
 
 const readlineSync = require('readline-sync');
 const noble = require('@abandonware/noble');
@@ -234,4 +232,5 @@ noble.on('discover', (peripheral) => {
         });
     }
 });
+
 
