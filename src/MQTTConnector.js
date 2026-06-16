@@ -1,7 +1,17 @@
+/*
+ * am43 MQTT connector — version 1.3 (2026-06-16 11:45 CEST)
+ *
+ * v1.3 (2026-06-16 11:45 CEST):
+ * - MQTT per-device command dedup window (3000ms)
+ */
+
 const mqtt = require('mqtt');
 
 const coverTopic = 'cover/';
 const sensorTopic = 'sensor/';
+const MQTT_CONNECTOR_VERSION = '1.3';
+const MQTT_DEDUP_WINDOW_MS = 3000;
+const dedupStateByDevice = new Map();
 
 class MQTTConnector {
     constructor(device, mqttUrl, baseTopic, username, password) {
@@ -18,11 +28,29 @@ class MQTTConnector {
         let deviceTopic = `${baseTopic}${coverTopic}${device.id}`;
         let deviceBatterySensorConfigTopic = `${baseTopic}${sensorTopic}${device.id}_battery`;
         let deviceLightSensorConfigTopic = `${baseTopic}${sensorTopic}${device.id}_light`;
+        device.log('mqtt connector v%s, dedup window %dms', MQTT_CONNECTOR_VERSION, MQTT_DEDUP_WINDOW_MS);
         mqttClient.subscribe([`${deviceTopic}/set`]);
         mqttClient.subscribe([`${deviceTopic}/setposition`]);
 
         mqttClient.on('message', (topic, message) => {
             device.log('mqtt message received %o, %o', topic, message.toString());
+            const now = Date.now();
+            if ((topic.endsWith('set') || topic.endsWith('setposition')) && message.length !== 0) {
+                const lastTimestamp = dedupStateByDevice.get(device.id) || 0;
+                const elapsedMs = now - lastTimestamp;
+                if (elapsedMs < MQTT_DEDUP_WINDOW_MS) {
+                    device.log(
+                        'mqtt dedup: dropping command for device %s (elapsed %dms < %dms) (%o, %o)',
+                        device.id,
+                        elapsedMs,
+                        MQTT_DEDUP_WINDOW_MS,
+                        topic,
+                        message.toString()
+                    );
+                    return;
+                }
+                dedupStateByDevice.set(device.id, now);
+            }
             if (topic.endsWith('set') && message.length !== 0) {
                 if (message.toString().toLowerCase() === 'open') {
                     device.log('requesting cover open');
@@ -117,3 +145,4 @@ class MQTTConnector {
 }
 
 module.exports = MQTTConnector;
+

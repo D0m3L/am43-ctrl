@@ -1,5 +1,9 @@
 /*
- * am43 BLE driver — version 1.2 (2026-06-16 10:18 CEST)
+ * am43 BLE driver — version 1.3 (2026-06-16 11:45 CEST)
+ *
+ * v1.3 (2026-06-16 11:45 CEST):
+ * - Per-device write queue to serialize overlapping command requests
+ * - Self-busy handling to avoid false "other device busy" loops
  *
  * v1.2 (2026-06-16 10:18 CEST):
  * - Disconnect fallback B+C (default): poll until peripheral.state is disconnected;
@@ -39,7 +43,7 @@ const lightNotificationIdentifier = "aa";
 //const fullMovingTime = 137000;
 const fullMovingTime = 15000;
 
-const DRIVER_VERSION = '1.2';
+const DRIVER_VERSION = '1.3';
 const INIT_STAGGER_MS = 60000;
 
 /**
@@ -105,6 +109,8 @@ class am43 extends EventEmitter {
         this.batterypercentage = null;
         this.lightpercentage = null;
         this.positionpercentage = null;
+        this.writeQueue = [];
+        this.writeInProgress = false;
     }
 
     /** Writes a debug line prefixed with am43:{id}. */
@@ -148,7 +154,11 @@ class am43 extends EventEmitter {
         am43.tryClearStaleBusy();
 
         if (am43.busyDevice != null) {
-            this.writeLog('Connection busy for other device ' + am43.busyDevice.id + ', delaying data read...');
+            if (am43.busyDevice.id === this.id) {
+                this.writeLog('Connection busy for current device, delaying data read...');
+            } else {
+                this.writeLog('Connection busy for other device ' + am43.busyDevice.id + ', delaying data read...');
+            }
             setTimeout(() => {
                 this.readData();
             }, 1000);
@@ -403,21 +413,40 @@ class am43 extends EventEmitter {
      * Entry point for command writes (open/close/stop/position). Waits if BLE is busy.
      */
     writeKey(handle, key) {
+        this.writeQueue.push({ handle, key });
+        this.processWriteQueue();
+    }
+
+    /** Processes queued write requests one-by-one per device instance. */
+    processWriteQueue() {
+        if (this.writeInProgress) {
+            return;
+        }
+
+        if (this.writeQueue.length === 0) {
+            return;
+        }
+
         am43.tryClearStaleBusy();
 
-        if (am43.busyDevice != null) {
+        if (am43.busyDevice != null && am43.busyDevice.id !== this.id) {
             this.writeLog('Connection busy for other device, waiting...');
             setTimeout(() => {
-                this.writeKey(handle, key);
+                this.processWriteQueue();
             }, 1000);
             return;
         }
 
-        this.performWriteKey(handle, key);
+        const nextWrite = this.writeQueue.shift();
+        this.writeInProgress = true;
+        this.performWriteKey(nextWrite.handle, nextWrite.key, () => {
+            this.writeInProgress = false;
+            this.processWriteQueue();
+        });
     }
 
     /** Connects, writes a hex key to the given GATT handle, disconnects, retries on failure. */
-    performWriteKey(handle, key) {
+    performWriteKey(handle, key, onDone) {
         this.success = false;
         am43.busyDevice = this;
         this.peripheral.connect();
@@ -438,12 +467,15 @@ class am43 extends EventEmitter {
                     self.writeLog("Writing unsuccessful, retrying in 1 second...");
                     self.currentRetry = self.currentRetry + 1;
                     setTimeout(() => {
-                        self.performWriteKey(handle, key);
+                        self.performWriteKey(handle, key, onDone);
                     }, 1000);
                 } else {
                     self.writeLog("Writing unsuccessful, giving up...");
                     am43.busyDevice = null;
                     self.currentRetry = 0;
+                    if (typeof onDone === 'function') {
+                        onDone();
+                    }
                 }
             } else {
                 self.writeLog("Writing was successful");
@@ -451,6 +483,9 @@ class am43 extends EventEmitter {
                 self.currentRetry = 0;
                 self.emit('stateChanged', self.getState());
                 self.scheduleForcedDataRead();
+                if (typeof onDone === 'function') {
+                    onDone();
+                }
             }
         }
 
@@ -469,7 +504,7 @@ class am43 extends EventEmitter {
     }
 
     /**
-     * Starts this device: initial read after 5s, then periodic readData on a unique interval.
+     * Starts this device: initial read after 9s, then periodic readData on a unique interval.
      * @param {number} poll - Minutes from CLI --interval; 0 = random 10–20 min per device
      */
     am43Init(poll = 0) {
@@ -488,7 +523,7 @@ class am43 extends EventEmitter {
         } else {
             let attempts = 0;
             do {
-                intervalMS = this.randomIntMinutes(10, 20);
+                intervalMS = this.randomIntMinutes(15, 20);
                 attempts++;
             } while (am43.assignedIntervals.has(intervalMS) && attempts < 50);
         }
@@ -514,7 +549,7 @@ class am43 extends EventEmitter {
         const self = this;
         setTimeout(() => {
             self.readData();
-        }, 5000);
+        }, 9000);
 
         setTimeout(() => {
             self.readData();
@@ -595,4 +630,5 @@ class am43 extends EventEmitter {
 module.exports = am43;
 module.exports.deviceTag = deviceTag;
 module.exports.DISCONNECT_FALLBACK_MODE = DISCONNECT_FALLBACK_MODE;
+
 

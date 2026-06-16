@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 /*
- * am43 entrypoint — version 1.2 (2026-06-16 10:18 CEST)
+ * am43 entrypoint — version 1.3 (2026-06-16 11:45 CEST)
+ *
+ * v1.3 (2026-06-16 11:45 CEST):
+ * - Pairs with src/am43.js v1.3 (write queue + self-busy protection)
  *
  * v1.2 (2026-06-16 10:18 CEST):
  * - Pairs with src/am43.js v1.2 (disconnect fallback B+C; see DISCONNECT_FALLBACK_MODE)
@@ -10,7 +13,7 @@
  * - Stop scan after discovery; version log, deviceTag heartbeat, noble warnings
  */
 
-const ENTRYPOINT_VERSION = '1.2';
+const ENTRYPOINT_VERSION = '1.3';
 
 const readlineSync = require('readline-sync');
 const noble = require('@abandonware/noble');
