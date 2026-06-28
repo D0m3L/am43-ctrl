@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 
 /*
- * am43 entrypoint — version 1.3 (2026-06-16 11:45 CEST)
+ * am43 entrypoint — version 1.2 (2026-06-24 17:00 CEST)
  *
- * v1.3 (2026-06-16 11:45 CEST):
- * - Pairs with src/am43.js v1.3 (write queue + self-busy protection)
- *
- * v1.2 (2026-06-16 10:18 CEST):
- * - Pairs with src/am43.js v1.2 (disconnect fallback B+C; see DISCONNECT_FALLBACK_MODE)
+ * v1.2 (2026-06-24 17:00 CEST):
+ * - Pairs with src/am43.js v1.2
+ * - Catch noble HCI EALREADY instead of crashing; BLE recovery cooldown
+ * - Verbose heartbeat: busy device, BLE cooldown, device count
  *
  * v1.1 (2026-06-12 12:30 CEST):
  * - Stop scan after discovery; version log, deviceTag heartbeat, noble warnings
  */
 
-const ENTRYPOINT_VERSION = '1.3';
+const ENTRYPOINT_VERSION = '1.2';
 
 const readlineSync = require('readline-sync');
 const noble = require('@abandonware/noble');
@@ -26,6 +25,22 @@ debugLog(
     ENTRYPOINT_VERSION,
     Am43.VERSION || 'unknown'
 );
+
+/** Last-resort guard: noble HCI EALREADY during disconnect teardown should not kill the process. */
+process.on('uncaughtException', (err) => {
+    if (err && (err.code === 'EALREADY' || (err.message && err.message.indexOf('EALREADY') !== -1))) {
+        const cooldownMs = Am43.BLE_RECOVERY_COOLDOWN_MS || 3000;
+        Am43.applyBleRecoveryCooldown(cooldownMs);
+        debugLog(
+            'noble HCI EALREADY caught, applying BLE recovery cooldown %dms: %s',
+            cooldownMs,
+            err.message
+        );
+        return;
+    }
+    throw err;
+});
+
 const moment = require('moment');
 
 const yargs = require('yargs');
@@ -179,7 +194,22 @@ function intervalFunc() {
     }
 
     const secondsDiff = now.diff(lastSuccess, 'seconds');
-    debugLog('Time since last successful connect: %s [%s]', Am43.deviceTag(lastSuccessId), secondsDiff);
+    const busy = Am43.busyDevice;
+    const busyLabel = busy
+        ? Am43.deviceTag(busy.id) + ' [' + busy.id + ']'
+        : 'none';
+    const cooldown = Am43.isBleCooldownActive()
+        ? 'on(' + Am43.getBleCooldownRemainingMs() + 'ms)'
+        : 'off';
+    debugLog(
+        'heartbeat: lastSuccess=%s [%s] ago=%ds busy=%s cooldown=%s devices=%d',
+        Am43.deviceTag(lastSuccessId),
+        lastSuccessId,
+        secondsDiff,
+        busyLabel,
+        cooldown,
+        ids.length
+    );
 
     if (failTime > 0 && secondsDiff > failTime) {
         log('Exiting since max time since last successful connection has elapsed...');
@@ -229,11 +259,12 @@ noble.on('discover', (peripheral) => {
 
         Object.values(devices).forEach((device) => {
             if (mqttUrl) {
+                debugLog('binding mqtt for %s broker=%s', device.id, mqttUrl);
                 new mqttBinding(device, mqttUrl, baseTopic, mqttUsername, mqttPassword);
             }
+            debugLog('starting device init for %s', device.id);
             device.am43Init(interval);
         });
     }
 });
-
 

@@ -1,4 +1,4 @@
-# Fork — modified am43-ctrl v1.1
+# Fork — modified am43-ctrl v1.2
 
 ## My setup
 
@@ -28,13 +28,33 @@ Symptoms with the original driver:
 
 At 10–15 meters (and two walls in betwenn), devices with the **factory BLE antenna inside the motor housing**, RSSI was around **~ -81 dBm to -85 dBm** — very weak and unstable. Connects often dropped within ~30 ms before GATT discovery; interval polls failed reliably.
 
-**Hardware fix:** routing the BLE antenna **outside** the motor housing improved signal to **~ -77 dBm** in btmon (`LE Advertising Report`). That is still on the edge for BLE, but with **v1.1** both motors poll reliably (startup + 10–20 min intervals).
+**Hardware fix:** routing the BLE antenna **outside** the motor housing improved signal to **~ -77 dBm** in btmon (`LE Advertising Report`). That is still on the edge for BLE, but with **v1.2** both motors poll reliably (startup + 10–20 min intervals).
 
 ---
 
 This repository is a fork of [binsentsu/am43-ctrl](https://github.com/binsentsu/am43-ctrl). **All original credit goes to [binsentsu](https://github.com/binsentsu) and the upstream project.** This fork keeps the same purpose: controlling AM43 blind motors over MQTT and/or HTTP.
 
 **Notice:** Parts of this fork were modified with assistance from AI. Review the changes before production use.
+
+## What changed in v1.2 (vs v1.1)
+
+**v1.2** is the current stable release. It keeps everything from v1.1 and adds production hardening for two motors on one BLE adapter. Changes are documented in the file headers of `index.js`, `src/am43.js`, and `src/MQTTConnector.js`. Summary:
+
+**`src/am43.js` (BLE driver)**
+- Disconnect fallback (`DISCONNECT_FALLBACK_MODE` v1.4): poll until disconnected (max 15s), safe 3s nudge, forced recovery + BLE cooldown; skip nudge while `disconnecting` (avoids noble HCI `EALREADY` crash)
+- Per-device write queue; self-busy handling to avoid false "other device busy" loops
+- Per-device read dedup window (5000ms); defer reads while a write is in progress on the same device
+- Read session management: `readInProgress`, session token, `forceReadSessionRecovery` on retry give-up (10/10) and stale sessions
+- `tryClearStaleBusy` for exhausted retries, long-stuck sessions, and disconnected peripherals without a disconnect event
+- `readData` no longer self-reschedules when a read session is already in progress (fixes infinite defer loops)
+
+**`index.js` (entrypoint)**
+- Catch noble HCI `EALREADY` instead of crashing; apply BLE recovery cooldown
+- Verbose heartbeat: busy device, BLE cooldown, device count
+
+**`src/MQTTConnector.js`**
+- MQTT per-device command dedup window (3000ms)
+- Verbose logging: rx topic/payload, dedup accept/drop, dispatch labels
 
 ## What changed in v1.1 (vs upstream)
 
@@ -79,7 +99,7 @@ This fork includes a Docker setup tested on **Raspberry Pi 4** with a 64-bit OS 
 | `TIMEO` | `-f` fail timeout (seconds since last successful read before exit) |
 | `MQTTUSER`, `MQTTPWD` | MQTT credentials (defined in Dockerfile; add `-u`/`-p` to ENTRYPOINT if needed) |
 
-**Important:** The current `Dockerfile` runs `npm install https://github.com/binsentsu/am43-ctrl`, which installs **upstream** code. To run **this fork (v1.1)**, build from a Dockerfile that copies this repository into the image (e.g. `COPY . /app/rolety/` and `npm install --legacy-peer-deps`) instead of installing from GitHub.
+**Important:** The current `Dockerfile` runs `npm install https://github.com/binsentsu/am43-ctrl`, which installs **upstream** code. To run **this fork (v1.2)**, build from a Dockerfile that copies this repository into the image (e.g. `COPY . /app/rolety/` and `npm install --legacy-peer-deps`) instead of installing from GitHub.
 
 BLE inside Docker requires host networking and elevated privileges — the container must see the Pi’s Bluetooth adapter.
 
@@ -88,7 +108,7 @@ BLE inside Docker requires host networking and elevated privileges — the conta
 From this repository root:
 
 ```bash
-# 1. Build the image (adjust Dockerfile first if you want v1.1 local code, not upstream npm)
+# 1. Build the image (adjust Dockerfile first if you want v1.2 local code, not upstream npm)
 docker build --platform linux/arm/v7 -t rolety:latest .
 
 # 2. Create/start the container (edit MACs, broker URL, ports in the script first)

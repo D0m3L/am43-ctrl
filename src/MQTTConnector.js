@@ -1,15 +1,17 @@
 /*
- * am43 MQTT connector — version 1.3 (2026-06-16 11:45 CEST)
+ * am43 MQTT connector — version 1.2 (2026-06-24 17:00 CEST)
  *
- * v1.3 (2026-06-16 11:45 CEST):
+ * v1.2 (2026-06-24 17:00 CEST):
+ * - Pairs with src/am43.js v1.2
  * - MQTT per-device command dedup window (3000ms)
+ * - Verbose logging: rx topic/payload, dedup accept/drop, dispatch labels
  */
 
 const mqtt = require('mqtt');
 
 const coverTopic = 'cover/';
 const sensorTopic = 'sensor/';
-const MQTT_CONNECTOR_VERSION = '1.3';
+const MQTT_CONNECTOR_VERSION = '1.2';
 const MQTT_DEDUP_WINDOW_MS = 3000;
 const dedupStateByDevice = new Map();
 
@@ -33,40 +35,46 @@ class MQTTConnector {
         mqttClient.subscribe([`${deviceTopic}/setposition`]);
 
         mqttClient.on('message', (topic, message) => {
-            device.log('mqtt message received %o, %o', topic, message.toString());
+            const payload = message.toString();
+            device.log('mqtt rx topic=%s payload=%s', topic, payload);
             const now = Date.now();
             if ((topic.endsWith('set') || topic.endsWith('setposition')) && message.length !== 0) {
                 const lastTimestamp = dedupStateByDevice.get(device.id) || 0;
-                const elapsedMs = now - lastTimestamp;
-                if (elapsedMs < MQTT_DEDUP_WINDOW_MS) {
+                const elapsedMs = lastTimestamp > 0 ? now - lastTimestamp : 0;
+                if (lastTimestamp > 0 && elapsedMs < MQTT_DEDUP_WINDOW_MS) {
                     device.log(
-                        'mqtt dedup: dropping command for device %s (elapsed %dms < %dms) (%o, %o)',
+                        'mqtt dedup: dropped %s (elapsed %dms < window %dms)',
                         device.id,
                         elapsedMs,
-                        MQTT_DEDUP_WINDOW_MS,
-                        topic,
-                        message.toString()
+                        MQTT_DEDUP_WINDOW_MS
                     );
                     return;
                 }
                 dedupStateByDevice.set(device.id, now);
+                device.log(
+                    'mqtt dedup: accepted %s (elapsed %dms, window %dms)',
+                    device.id,
+                    elapsedMs,
+                    MQTT_DEDUP_WINDOW_MS
+                );
             }
             if (topic.endsWith('set') && message.length !== 0) {
-                if (message.toString().toLowerCase() === 'open') {
-                    device.log('requesting cover open');
+                const cmd = payload.toLowerCase();
+                if (cmd === 'open') {
+                    device.log('mqtt dispatch: OPEN');
                     device.am43Open();
-                } else  if (message.toString().toLowerCase() === 'close'){
-                    device.log('requesting cover close');
+                } else if (cmd === 'close') {
+                    device.log('mqtt dispatch: CLOSE');
                     device.am43Close();
-                }
-                else  if (message.toString().toLowerCase() === 'stop'){
-                    device.log('requesting cover stop');
+                } else if (cmd === 'stop') {
+                    device.log('mqtt dispatch: STOP');
                     device.am43Stop();
+                } else {
+                    device.log('mqtt dispatch: ignored unknown set payload=%s', payload);
                 }
-            }
-            else if(topic.endsWith('setposition') && message.length !== 0){
-                device.log('requesting position ' + message);
-                device.am43GotoPosition(parseInt(message, 10))
+            } else if (topic.endsWith('setposition') && message.length !== 0) {
+                device.log('mqtt dispatch: SET_POSITION %s', payload);
+                device.am43GotoPosition(parseInt(payload, 10));
             }
         });
 
@@ -122,8 +130,9 @@ class MQTTConnector {
         device.log(`mqtt topic ${deviceTopic}`);
 
         device.on('stateChanged', (data) => {
-            device.log(`state changed received: ${JSON.stringify(data)}`);
-            mqttClient.publish(`${deviceTopic}/state`, JSON.stringify(data), {retain:true});
+            const json = JSON.stringify(data);
+            device.log('mqtt state publish: %s', json);
+            mqttClient.publish(`${deviceTopic}/state`, json, {retain:true});
         });
 
         mqttClient.on('connect', () => {
@@ -134,7 +143,7 @@ class MQTTConnector {
             mqttClient.publish(`${deviceBatterySensorConfigTopic}/config`, JSON.stringify(batterySensorConfig), {retain: true});
             mqttClient.publish(`${deviceLightSensorConfigTopic}/config`, JSON.stringify(lightSensorConfig), {retain: true});
             mqttClient.publish(`${deviceTopic}/connection`, 'Online', {retain:true});
-            device.log('mqtt connected')
+            device.log('mqtt connected (broker=%s, topic=%s)', mqttUrl, deviceTopic);
         });
         mqttClient.on('end', () => device.log('mqtt ended'));
         mqttClient.on('error', (e) => device.log('mqtt error %o', e));
