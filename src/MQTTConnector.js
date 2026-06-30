@@ -84,23 +84,27 @@ class MQTTConnector {
             manufacturer: 'Generic AM43'
         };
 
-        let coverConfig = {
-            name: device.id,
-            command_topic: `${deviceTopic}/set`,
-            position_topic: `${deviceTopic}/state`,
-            set_position_topic: `${deviceTopic}/setposition`,
-            position_open: 0,
-            position_closed: 100,
-            availability_topic: `${deviceTopic}/connection`,
-            payload_available: 'Online',
-            payload_not_available: 'Offline',
-            payload_open: 'OPEN',
-            payload_close: 'CLOSE',
-            payload_stop: 'STOP',
-            value_template: '{{value_json[\'position\']}}',
-            unique_id: `am43_${device.id}_cover`,
-            device: deviceInfo
-        };
+let coverConfig = {
+    name: device.id,
+    command_topic: `${deviceTopic}/set`,
+    state_topic: `${deviceTopic}/state`,
+    value_template: '{{value_json[\'state\']}}',
+    state_open: 'OPEN',
+    state_closed: 'CLOSE',
+    position_topic: `${deviceTopic}/state`,
+    position_template: '{{value_json[\'position\']}}',
+    set_position_topic: `${deviceTopic}/setposition`,
+    position_open: 0,
+    position_closed: 100,
+    availability_topic: `${deviceTopic}/connection`,
+    payload_available: 'Online',
+    payload_not_available: 'Offline',
+    payload_open: 'OPEN',
+    payload_close: 'CLOSE',
+    payload_stop: 'STOP',
+    unique_id: `am43_${device.id}_cover`,
+    device: deviceInfo
+};
 
         let batterySensorConfig = {
             name: device.id + ' Battery',
